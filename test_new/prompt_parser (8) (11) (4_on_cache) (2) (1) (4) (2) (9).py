@@ -1140,3 +1140,4 @@ if __name__ == "__main__":
     assert len(set([txt for _, txt in one])) == 1  # один и тот же вариант на всех шагах
 
     print("All integration tests passed!")
+
