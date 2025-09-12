@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from __future__ import annotations
 import re
 from collections import namedtuple
 import lark
@@ -256,6 +256,10 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 
                 # Convert number_node to a float (scheduling weight or total steps percentage)
                 try:
+                    # Ensure we extract a leaf if it's a Tree
+                    if isinstance(number_node, lark.Tree):
+                        number_node = resolve_tree(number_node)
+                
                     v = float(number_node)
                 except ValueError:
                     return
@@ -483,7 +487,7 @@ class SdConditioning(list):
     A list with prompts for stable diffusion's conditioner model.
     Can also specify width and height of created image - SDXL needs it.
     """
-    def __init__(self, prompts, is_negative_prompt=False, width=None, height=None, copy_from=None):
+    def __init__(self, prompts, is_negative_prompt=False, width=None, height=None, copy_from=None, distilled_cfg_scale=None):
         super().__init__()
         self.extend(prompts)
 
@@ -493,6 +497,7 @@ class SdConditioning(list):
         self.is_negative_prompt = is_negative_prompt or getattr(copy_from, 'is_negative_prompt', False)
         self.width = width or getattr(copy_from, 'width', None)
         self.height = height or getattr(copy_from, 'height', None)
+        self.distilled_cfg_scale = distilled_cfg_scale or getattr(copy_from, 'distilled_cfg_scale', None)
 
 
 
