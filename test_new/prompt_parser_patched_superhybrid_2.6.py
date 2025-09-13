@@ -2170,9 +2170,9 @@ def get_multicond_learned_conditioning(model, prompts, steps, hires_steps=None, 
     return MulticondLearnedConditioning(shape, res_batch)
 
 
-  # Делим по слову AND и по одиночному '&' как самостоятельному токену.
-  # Не трогаем AND_PERP / AND_SALT / AND_TOPK.
-  re_AND = re.compile(r"(?:\bAND\b|(?<!\S)&(?!\S))(?!_PERP|_SALT|_TOPK)", re.I)
+# Делим по слову AND и по одиночному '&' как самостоятельному токену.
+# Не трогаем AND_PERP / AND_SALT / AND_TOPK.
+re_AND = re.compile(r"(?:\bAND\b|(?<!\S)&(?!\S))(?!_PERP|_SALT|_TOPK)", re.I)
 # Вес в конце подпрампта: "text : 1.2" (якорь на конец строки, поддержка китайского двоеточия)
 RE_END_WEIGHT = re.compile(
     r"^(?P<text>.*?)"
