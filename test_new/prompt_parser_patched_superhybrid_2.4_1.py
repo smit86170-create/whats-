@@ -22,15 +22,31 @@ def _env_bool(name: str, default: str = "0") -> bool:
     v = str(os.getenv(name, default)).strip().lower()
     return v not in ("0", "", "false", "no", "off")
 
+def _env_int(name: str, default: int) -> int:
+    """Read an integer environment variable with a fallback.
+
+    Attempts to convert the environment variable *name* to ``int``. If the
+    variable is unset or cannot be parsed as an integer, ``default`` is
+    returned and a warning is logged.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid value for %s=%r, using default %d", name, raw, default)
+        return default
+
 SAFE_EMPTY = " "
 
 ALLOW_EMPTY_ALTERNATE          = _env_bool("ALLOW_EMPTY_ALTERNATE", "1")
 EXPAND_ALTERNATE_PER_STEP      = _env_bool("EXPAND_ALTERNATE_PER_STEP", "1")
-GROUP_COMBO_LIMIT              = int(os.getenv("GROUP_COMBO_LIMIT", "100"))
+GROUP_COMBO_LIMIT              = _env_int("GROUP_COMBO_LIMIT", 100)
 DEDUP_SCHEDULE_STEPS           = _env_bool("DEDUP_SCHEDULE_STEPS", "0")
 GROUP_COMBO_FALLBACK           = os.getenv("GROUP_COMBO_FALLBACK", "truncate").strip().lower()  # "truncate"|"literal"|"sample"
 SUPPRESS_STANDALONE_COLON      = _env_bool("SUPPRESS_STANDALONE_COLON", "1")
-CACHE_SIZE                     = int(os.getenv("PROMPT_PARSER_CACHE_SIZE", "4096"))
+CACHE_SIZE                     = _env_int("PROMPT_PARSER_CACHE_SIZE", 4096)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,6 +63,7 @@ RE_NUMERIC_FULL = re.compile(rf"^(?:{NUMERIC_RE})$")
 # ──────────────────────────────────────────────────────────────────────────────
 
 _re_ws_collapse = re.compile(r"[ \t\r\n]+")
+_re_unescape_literals = re.compile(r"\\([:\[\]\(\)\{\}\|!\\])")
 
 @lru_cache(maxsize=CACHE_SIZE)
 def _collapse_spaces(s: str) -> str:
@@ -54,25 +71,10 @@ def _collapse_spaces(s: str) -> str:
     return _re_ws_collapse.sub(" ", s).strip()
 
 def _unescape_literals(s: str) -> str:
-    """
-    Разэкранировать самые частые литералы, которые встречаются в промптах:
-    '\\:' -> ':', '\\[' -> '[', '\\]' -> ']', '\\(' -> '(', '\\)' -> ')', '\\\\' -> '\\'
-    Важно: сначала обрабатываем специализированные пары, потом общий '\\\\'.
-    """
+    """Разэкранировать часто встречающиеся литералы в промптах."""
     if not s:
         return s
-    s = (s.replace(r"\:", ":")
-           .replace(r"\[", "[")
-           .replace(r"\]", "]")
-           .replace(r"\(", "(")
-           .replace(r"\)", ")")
-           .replace(r"\{", "{")
-           .replace(r"\}", "}")
-           .replace(r"\|", "|")
-           .replace(r"\!", "!"))
-    # двойной бэкслеш в конце
-    s = s.replace(r"\\", "\\")
-    return s
+    return _re_unescape_literals.sub(r"\1", s)
 
 def _strip_outer_parens_once(s: str) -> str:
     """Снять ОДИН раз внешние круглые скобки, если они действительно обрамляют весь текст."""
