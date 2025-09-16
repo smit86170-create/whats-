@@ -66,9 +66,16 @@ _re_ws_collapse = re.compile(r"[ \t\r\n]+")
 _re_unescape_literals = re.compile(r"\\([:\[\]\(\)\{\}\|!\\])")
 
 @lru_cache(maxsize=CACHE_SIZE)
-def _collapse_spaces(s: str) -> str:
-    """Сжать повторяющиеся пробелы/переводы строк в один пробел и обрезать края."""
-    return _re_ws_collapse.sub(" ", s).strip()
+def _collapse_spaces(s: str, keep_edges: bool = False) -> str:
+    """Сжать повторяющиеся пробелы/переводы строк в один пробел.
+
+    Если ``keep_edges`` установлен в ``True``, ведущие и хвостовые пробелы сохраняются,
+    иначе итоговая строка обрезается по краям.
+    """
+    collapsed = _re_ws_collapse.sub(" ", s)
+    if keep_edges:
+        return collapsed
+    return collapsed.strip()
 
 def _unescape_literals(s: str) -> str:
     """Разэкранировать часто встречающиеся литералы в промптах."""
@@ -855,7 +862,10 @@ class CollectSteps(lark.Visitor):
                 schedules.append([min(en, self.steps), _concat_prefix_text_suffix(self.prefix, prompts[i], self.suffix)])
             if ranges and ranges[-1][1] < self.steps and prompts:
                 schedules.append([self.steps, _concat_prefix_text_suffix(self.prefix, prompts[-1], self.suffix)])
-            return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules] or [[self.steps, _apply_and(_collapse_spaces(_unescape_literals(inner.strip())))]]
+            return (
+                [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
+                or [[self.steps, _apply_and(_collapse_spaces(_unescape_literals(inner), keep_edges=True))]]
+            )
 
         # (B) «Чистый» "[...]:N [reverse]" без диапазонов — только если ровно одна пара []
         if full.count('[') == 1 and full.count(']') == 1 and not _RE_UNESCAPED_ALT_OR_BANG.search(full):
@@ -881,7 +891,7 @@ class CollectSteps(lark.Visitor):
                     schedules = _build_bracket_after_schedules(
                         self.prefix + pre, prompts, boundary, post + self.suffix, self.steps
                     )
-                    return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+                    return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
                 except ValueError:
                     pass
         return self._default_visit(tree)
@@ -897,7 +907,7 @@ class CollectSteps(lark.Visitor):
         return []
 
     def visit_start(self, tree):
-        full = resolve_tree(tree, keep_spacing=True).strip()
+        full = resolve_tree(tree, keep_spacing=True)
         # ── FAST-PATH (1): "[a:b] : N RANGES [reverse]" — ОБРАБАТЫВАЕМ ПЕРВЫМ ──
         m_rng = RE_BRACKET_AFTER_WITH_RANGES.match(full)
         if m_rng and '|' not in full:
@@ -946,7 +956,10 @@ class CollectSteps(lark.Visitor):
             if ranges and ranges[-1][1] < self.steps and prompts:
                 schedules.append([self.steps, _concat_prefix_text_suffix(self.prefix, prompts[-1], self.suffix)])
 
-            return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules] or [[self.steps, _apply_and(_collapse_spaces(_unescape_literals(inner.strip())))]]
+            return (
+                [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
+                or [[self.steps, _apply_and(_collapse_spaces(_unescape_literals(inner), keep_edges=True))]]
+            )
 
         # ── FAST-PATH (2): "pre [a:b:c] : N [reverse] post" (без диапазонов) ──
         m_ba = RE_BRACKET_AFTER.match(full)
@@ -981,7 +994,7 @@ class CollectSteps(lark.Visitor):
             schedules = _build_bracket_after_schedules(
                 self.prefix + (pre or ""), prompts, boundary, (post or "") + self.suffix, self.steps
             )
-            return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+            return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
 
         # 0) owner::a::b!!, trailing
         if "::" in full and "!!" in full and all(ch not in full for ch in '[]()'):
@@ -993,7 +1006,7 @@ class CollectSteps(lark.Visitor):
             out = f"{owner.strip()} -> {', '.join(sequences)}"
             if trailing_text:
                 out += f", {', '.join(trailing_text)}"
-            return [[self.steps, _collapse_spaces(self.prefix + out + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + out + self.suffix, keep_edges=True)]]
 
         # 1) owner::a::b!
         if '::' in full and (full.endswith('!') or full.endswith(';')) and all(ch not in full for ch in '[]()'):
@@ -1001,7 +1014,7 @@ class CollectSteps(lark.Visitor):
             rest = rest[:-1]
             descriptors = [x.strip(' ,~!;') for x in rest.split('::') if x.strip(' ,~!;')]
             text = f"{owner.strip()}: {', '.join(descriptors)}"
-            return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
         # 2) [a:b:...:N] — допускаем скобки внутри и безопасно сплитим,
         # запускаем fast-path только если в строке ровно одна пара []
@@ -1023,7 +1036,7 @@ class CollectSteps(lark.Visitor):
                                 prompts = list(reversed(prompts))
                         boundary = _to_end_step(boundary_f, self.steps)
                         schedules = _build_bracket_inner_schedules(self.prefix + pre, prompts, boundary, post + self.suffix, self.steps)
-                        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+                        return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
             except ValueError:
                 pass
 
@@ -1053,7 +1066,7 @@ class CollectSteps(lark.Visitor):
                 child_scheds.append(sub)
 
         if not child_scheds:
-            return [[self.steps, _collapse_spaces(self.prefix + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + self.suffix, keep_edges=True)]]
 
         # 2) Объединённые границы всех детей
         boundaries = sorted({int(e) for sched in child_scheds for (e, _) in sched})
@@ -1069,7 +1082,7 @@ class CollectSteps(lark.Visitor):
         for end in boundaries:
             parts = [pick_text(s, end) for s in child_scheds]
             text = self.prefix + "".join(parts) + self.suffix
-            text = _apply_and(_collapse_spaces(text))
+            text = _apply_and(_collapse_spaces(text, keep_edges=True))
             if not out or out[-1][1] != text:
                 out.append([end, text])
 
@@ -1079,26 +1092,26 @@ class CollectSteps(lark.Visitor):
     def _visit_token(self, token):
         if token.type == "WHITESPACE":
             return []
-        return [[self.steps, _collapse_spaces(self.prefix + str(token) + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + str(token) + self.suffix, keep_edges=True)]]
 
     def visit_plain(self, tree):
         text = resolve_tree(tree, keep_spacing=True)
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_top_level_sequence3(self, tree):
         transformer = ScheduleTransformer(self.steps, 1, self.seed)
         text = transformer.transform(tree)
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_top_level_sequence(self, tree):
         # Аналогично visit_top_level_sequence3, но для 'owner::a::b!!, tail'
         transformer = ScheduleTransformer(self.steps, 1, self.seed)
         text = transformer.transform(tree)
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_scheduled(self, tree):
         if not tree.children:
-            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
 
         import lark as _l
         # Берём только поддеревья prompt (исключаем служебные узлы)
@@ -1121,7 +1134,7 @@ class CollectSteps(lark.Visitor):
             weight = 1.0
 
         if not prompts:
-            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
 
         def _clamp_step(x: int) -> int:
             return max(1, min(x, self.steps))
@@ -1175,7 +1188,7 @@ class CollectSteps(lark.Visitor):
             if is_reverse and not has_affixes:
                 prompt_texts = prompt_texts[::-1]
             schedules = _build_bracket_after_schedules(self.prefix, prompt_texts, boundary, self.suffix, self.steps)
-            return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+            return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
 
         # ★ Фикс: пролог добавляем ТОЛЬКО если первый старт > 1 (и для процентов, и для чисел)
         schedules: list[list[int, str]] = []
@@ -1207,9 +1220,9 @@ class CollectSteps(lark.Visitor):
             schedules.append([self.steps, _concat_prefix_text_suffix(self.prefix, tail_text, self.suffix)])
 
         if not schedules:
-            return [[self.steps, _collapse_spaces(self.prefix + resolve_tree(tree, keep_spacing=True) + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + resolve_tree(tree, keep_spacing=True) + self.suffix, keep_edges=True)]]
 
-        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+        return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
 
 
     def visit_alternate(self, tree):
@@ -1234,15 +1247,15 @@ class CollectSteps(lark.Visitor):
         if last_sep:
             vals.append("")  # хвостовой разделитель -> пустая опция
         if not vals:
-            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
         if EXPAND_ALTERNATE_PER_STEP:
             schedules = []
             for step in range(1, self.steps + 1):
                 choice = vals[(step - 1) % len(vals)]
-                schedules.append([step, _collapse_spaces(self.prefix + choice + self.suffix)])
+                schedules.append([step, _collapse_spaces(self.prefix + choice + self.suffix, keep_edges=True)])
             return [[e, _apply_and(t)] for e, t in schedules]
         choice = self.rng.choice(vals)
-        return [[self.steps, _collapse_spaces(self.prefix + choice + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + choice + self.suffix, keep_edges=True)]]
 
     def visit_alternate_distinct(self, tree):
         import lark as _l
@@ -1266,9 +1279,9 @@ class CollectSteps(lark.Visitor):
                 options.append([txt])
         flat = [opt for group in options for opt in group]
         if not flat:
-            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
         selected = self.rng.choice(flat)
-        return [[self.steps, _collapse_spaces(self.prefix + selected + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + selected + self.suffix, keep_edges=True)]]
 
     def visit_alternate1(self, tree):
         # Собираем варианты, включая потенциально пустые
@@ -1302,17 +1315,17 @@ class CollectSteps(lark.Visitor):
             options.append("")
 
         if not options:
-            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
 
         if EXPAND_ALTERNATE_PER_STEP:
             schedules = []
             for step in range(1, self.steps + 1):
                 choice = options[(step - 1) % len(options)]
-                schedules.append([step, _collapse_spaces(self.prefix + choice + self.suffix)])
+                schedules.append([step, _collapse_spaces(self.prefix + choice + self.suffix, keep_edges=True)])
             return [[e, _apply_and(t)] for e, t in schedules]
         else:
             choice = self.rng.choice(options)
-            return [[self.steps, _collapse_spaces(self.prefix + choice + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + choice + self.suffix, keep_edges=True)]]
 
 
     def visit_alternate2(self, tree):
@@ -1328,12 +1341,12 @@ class CollectSteps(lark.Visitor):
         for opt in options:
             combined.append(opt if "_" in opt or not suffix else f"{opt}_{suffix}")
         text = "|".join(combined) if combined else "empty_prompt"
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_weighted(self, tree):
         tr = ScheduleTransformer(self.steps, 1, self.seed)
         text = tr.transform(tree)  # '(token:1.2)'
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_grouped(self, tree):
         # Собираем варианты по дочерним узлам (сохраняем пустые элементы)
@@ -1359,7 +1372,7 @@ class CollectSteps(lark.Visitor):
                 # Возвращаем псевдолитерал, начинающийся с "{[" чтобы сохранить сигнал исходной формы
                 inner = ", ".join(resolve_tree(c, keep_spacing=True) for c in tree.children if not (isinstance(c, lark.Token) and c.type == "WHITESPACE"))
                 original = "{[" + inner + "]}"
-                return [[self.steps, _collapse_spaces(self.prefix + original + self.suffix)]]
+                return [[self.steps, _collapse_spaces(self.prefix + original + self.suffix, keep_edges=True)]]
             elif mode == "sample":
                 k = GROUP_COMBO_LIMIT
                 lens = [max(1, len(opts)) for opts in all_options]
@@ -1376,7 +1389,7 @@ class CollectSteps(lark.Visitor):
                     combo = [all_options[d][i] if all_options[d] else "" for d, i in enumerate(idx)]
                     text = ", ".join(combo).strip()
                     if text:
-                        out.append([self.steps, _collapse_spaces(self.prefix + text + self.suffix)])
+                        out.append([self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)])
                 if out:
                     return out
                 # иначе сваливаемся на усечение (truncate)
@@ -1387,13 +1400,13 @@ class CollectSteps(lark.Visitor):
                 break
             text = ", ".join(combo).strip()
             if text:
-                out.append([self.steps, _collapse_spaces(self.prefix + text + self.suffix)])
-        return out or [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+                out.append([self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)])
+        return out or [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
 
     def visit_sequence(self, tree):
         transformer = ScheduleTransformer(self.steps, 1, self.seed)
         text = transformer.transform(tree)
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_nested_sequence(self, tree):
         elements = [resolve_tree(c, keep_spacing=True).strip(" ,~!;")
@@ -1404,7 +1417,7 @@ class CollectSteps(lark.Visitor):
             text = self.rng.choice(elements) if elements else "empty_prompt"
         else:
             text = f"[{' | '.join(elements)}]"
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_numbered(self, tree):
         quantity = int(tree.children[0])
@@ -1437,7 +1450,7 @@ class CollectSteps(lark.Visitor):
             child_schedules = self.visit(target)
             options = [s[1] for s in child_schedules]
         if not options:
-            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
+            return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix, keep_edges=True)]]
 
         if distinct:
             seen = []
@@ -1452,7 +1465,7 @@ class CollectSteps(lark.Visitor):
         else:
             selected = self.rng.choices(options, k=quantity)
 
-        return [[self.steps, _collapse_spaces(self.prefix + ", ".join(selected) + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + ", ".join(selected) + self.suffix, keep_edges=True)]]
 
     def visit_and_rule(self, tree):
         import lark as _l
@@ -1466,13 +1479,13 @@ class CollectSteps(lark.Visitor):
                 if s:
                     parts.append(s)
         text = " and ".join(parts)
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def visit_emphasized(self, tree):
         # на уровне визитора возвращаем уже отформатированный "(text:weight)"
         tr = ScheduleTransformer(self.steps, 1, self.seed)
         text = tr.transform(tree)
-        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
+        return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix, keep_edges=True)]]
 
     def __call__(self, tree):
         self.schedules = self.visit(tree)
@@ -1492,7 +1505,7 @@ class CollectSteps(lark.Visitor):
                 last_end = None
             if isinstance(last_end, int) and last_end < int(self.steps):
                 uniq.append([int(self.steps), uniq[-1][1]])
-        return uniq or [[self.steps, _collapse_spaces(self.prefix + resolve_tree(tree, keep_spacing=True) + self.suffix)]]
+        return uniq or [[self.steps, _collapse_spaces(self.prefix + resolve_tree(tree, keep_spacing=True) + self.suffix, keep_edges=True)]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1593,7 +1606,7 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
         text = f"{owner.strip()} -> {', '.join(seq_texts)}"
         if trailing_texts:
             text += f", {', '.join(trailing_texts)}"
-        return [[steps, _apply_and(_collapse_spaces(text))]]
+        return [[steps, _apply_and(_collapse_spaces(text, keep_edges=True))]]
 
     # Numbered альтернативы в []
     m_num_alt = _re.match(r'^\s*(\d+)\s*([!_])?\s*\[([^\]]+)\]\s*$', str(prompt))
@@ -1615,7 +1628,7 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
         else:
             rng = _rnd.Random(seed) if seed is not None else _rnd
             chosen = rng.choices(options_unique, k=quantity)
-        return [[steps, _apply_and(_collapse_spaces(', '.join(chosen)))]]
+        return [[steps, _apply_and(_collapse_spaces(', '.join(chosen), keep_edges=True))]]
 
 
     # Явные диапазоны: "[...]:N a-b,c-d [r]" — ДОЛЖНЫ идти ПЕРЕД общим "[...]:N"
@@ -1656,7 +1669,10 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
             schedules.append([min(end, steps), prompts[i]])
         if ranges and ranges[-1][1] < steps and prompts:
             schedules.append([steps, prompts[-1]])
-        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules] or [[steps, _apply_and(_collapse_spaces(_unescape_literals(inner.strip())))]]
+        return (
+            [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
+            or [[steps, _apply_and(_collapse_spaces(_unescape_literals(inner), keep_edges=True))]]
+        )
 
     # НОВЫЙ fast-path: "[...:N]" (число/доля *внутри* скобок)
     m_inner = _re.match(r'(?s)^(.*)\[(.*?)\](.*)$', prompt)
@@ -1682,7 +1698,7 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
                         prompts = list(reversed(prompts))
                     boundary = _to_end_step(boundary_f, steps)
                     schedules = _build_bracket_inner_schedules(pre, prompts, boundary, post, steps)
-                    return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+                    return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
 
     # "[...]:N" с префиксом/суффиксом — общий случай
     m_with_pre = RE_BRACKET_AFTER.match(prompt)
@@ -1712,7 +1728,7 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
                     inner_prompts = list(reversed(inner_prompts))
 
                 schedules = _build_bracket_after_schedules(pre, inner_prompts, boundary, post, steps)
-                return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+                return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
             except Exception:
                 pass
 
@@ -1723,7 +1739,7 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
         tree = schedule_parser.parse(prompt)
     except lark.exceptions.LarkError as e:
         logger.warning("Prompt parse failed: '%s' — %s", prompt, e)
-        return [[steps, _collapse_spaces(prompt)]]
+        return [[steps, _collapse_spaces(prompt, keep_edges=True)]]
 
     collector = CollectSteps(steps, use_scheduling=use_scheduling, seed=seed)
     schedules = collector(tree)
@@ -1739,17 +1755,17 @@ def get_schedule(prompt: str, steps: int, use_scheduling: bool, seed: int | None
             pass
 
     if not schedules:
-        return [[steps, _collapse_spaces(prompt)]]
+        return [[steps, _collapse_spaces(prompt, keep_edges=True)]]
 
     if not use_visitor:
         rebuilt = []
         for end_step, _ in schedules:
             transformer = ScheduleTransformer(total_steps=steps, current_step=end_step, seed=seed)
             text = transformer.transform(tree)
-            rebuilt.append([end_step, _apply_and(_collapse_spaces(text))])
+            rebuilt.append([end_step, _apply_and(_collapse_spaces(text, keep_edges=True))])
         return rebuilt
 
-    return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+    return [[e, _apply_and(_collapse_spaces(t, keep_edges=True))] for e, t in schedules]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
