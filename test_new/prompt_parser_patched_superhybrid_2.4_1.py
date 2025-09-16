@@ -103,8 +103,9 @@ def _norm_join(*parts: str) -> str:
 def _norm_join_keep_edges(*parts: str) -> str:
     """Как _norm_join, но без .strip() по краям (используется локально при сборке)."""
     s = _re_ws_collapse.sub(" ", "".join(parts))
-    """Collapses whitespace without trimming leading or trailing spaces."""
-     return s
+    # Collapses whitespace without trimming leading or trailing spaces.
+    return s
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Склейка префикса/ядра/суффикса с корректной обработкой пробелов
