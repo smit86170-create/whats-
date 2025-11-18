@@ -1718,7 +1718,7 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
             schedules.append([min(end, steps), prompts[i]])
         if ranges and ranges[-1][1] < steps and prompts:
             schedules.append([steps, prompts[-1]])
-        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules] or [[steps, _apply_and(_collapse_spaces(_unescape_literals(inner.strip())))]]
+        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
 
     # НОВЫЙ fast-path: "[...:N]" (число/доля *внутри* скобок)
     m_inner = _re.match(r'(?s)^(.*)\[(.*?)\](.*)$', prompt)
