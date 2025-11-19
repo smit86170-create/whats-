@@ -316,7 +316,7 @@ if ALLOW_EMPTY_ALTERNATE:
 
 # NB: расширили класс одиночных знаков в start, чтобы '!' не валил парсер для plain'ов/compound'ов
 _grammar = r"""
-!start: (prompt | /[][():,!|&]/+)* # добавили | и &
+!start: (prompt | /[][():,!|&]/+)*
 
 prompt: (scheduled | emphasized | grouped
         | alternate | alternate_distinct
@@ -2561,3 +2561,4 @@ def visualize_schedule(text: str, steps: int = 20, seed: int | None = None) -> s
         out_lines.append(f"Шаги {start}-{end}: {t}")
         prev_end = end
     return "\n".join(out_lines)
+
