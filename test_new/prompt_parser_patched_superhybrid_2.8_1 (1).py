@@ -316,7 +316,7 @@ if ALLOW_EMPTY_ALTERNATE:
 
 # NB: расширили класс одиночных знаков в start, чтобы '!' не валил парсер для plain'ов/compound'ов
 _grammar = r"""
-!start: (prompt | /[][():,!]/+)*
+!start: (prompt | /[][():,!|&]/+)* # добавили | и &
 
 prompt: (scheduled | emphasized | grouped
         | alternate | alternate_distinct
@@ -353,9 +353,9 @@ sequence: prompt "::" prompt ("," | WHITESPACE)* nested_sequence* ("!" | ";")?
 nested_sequence: "::" prompt ("," | WHITESPACE)* ("!" | ";" | "~")?
 
 compound: /[a-zA-Z0-9]+(_[a-zA-Z0-9]+)+/
-numbered: NUMBER_Q ("!" | "_")? (grouped | sequence | compound | and_rule | plain | alternate | alternate_distinct | alternate2 | alternate1)
+numbered: NUMBER_Q ("!" | "_")? (grouped | sequence | alternate | alternate_distinct | alternate2 | alternate1)
 
-and_rule: (plain | compound | weighted | emphasized) ("&" (plain | compound | weighted | emphasized))+
+and_rule: (plain | compound | weighted | emphasized | alternate | alternate_distinct | alternate2 | alternate1 | scheduled) ("&" (plain | compound | weighted | emphasized | alternate | alternate_distinct | alternate1 | scheduled))+
  WHITESPACE: /\s+/
 plain: /([^\\[\]\{\}\(\),&:!|]|\\.)+/
 
