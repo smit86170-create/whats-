@@ -7,8 +7,6 @@ import lark
 import random
 import hashlib  # FIX #3: Для стабильного хеширования
 import sys      # FIX #6: Для лимита рекурсии
-# Увеличиваем лимит рекурсии для глубоко вложенных промптов
-sys.setrecursionlimit(5000)
 from functools import lru_cache
 from itertools import product
 from typing import Sequence, Tuple
@@ -16,11 +14,23 @@ from typing import Sequence, Tuple
 import os
 import logging
 logger = logging.getLogger(__name__)  # не настраиваем basicConfig в библиотеке
-# --- ВСТАВИТЬ ЭТО ПОСЛЕ ОСТАЛЬНЫХ ИМПОРТОВ ---
-try:
-    import torch
-except ImportError:
-    torch = None
+
+torch = None
+
+
+def _ensure_torch():
+    """Lazily import torch to avoid heavy import at module load time."""
+    global torch
+    if torch is not None:
+        return torch
+    try:
+        import torch as _torch
+    except ImportError as exc:
+        raise ImportError(
+            "Torch is required for conditioning reconstruction but is not installed."
+        ) from exc
+    torch = _torch
+    return torch
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Фиче-флаги (переопределяемые через env)
@@ -34,15 +44,37 @@ def _env_bool(name: str, default: str = "0") -> bool:
     v = str(os.getenv(name, default)).strip().lower()
     return v not in ("0", "", "false", "no", "off")
 
+def _env_int(name: str, default: int) -> int:
+    """Безопасно прочитать целочисленное значение из окружения.
+
+    При некорректном значении возвращает ``default`` и пишет предупреждение
+    в лог, чтобы не падать при импорте модуля.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid value for %s=%r, using default %d", name, raw, default)
+        return default
+
 SAFE_EMPTY = " "
 
 ALLOW_EMPTY_ALTERNATE          = _env_bool("ALLOW_EMPTY_ALTERNATE", "1")
 EXPAND_ALTERNATE_PER_STEP      = _env_bool("EXPAND_ALTERNATE_PER_STEP", "1")
-GROUP_COMBO_LIMIT              = int(os.getenv("GROUP_COMBO_LIMIT", "100"))
+GROUP_COMBO_LIMIT              = _env_int("GROUP_COMBO_LIMIT", 100)
 DEDUP_SCHEDULE_STEPS           = _env_bool("DEDUP_SCHEDULE_STEPS", "0")
 GROUP_COMBO_FALLBACK           = os.getenv("GROUP_COMBO_FALLBACK", "truncate").strip().lower()  # "truncate"|"literal"|"sample"
 SUPPRESS_STANDALONE_COLON      = _env_bool("SUPPRESS_STANDALONE_COLON", "1")
-CACHE_SIZE                     = int(os.getenv("PROMPT_PARSER_CACHE_SIZE", "4096"))
+CACHE_SIZE                     = _env_int("PROMPT_PARSER_CACHE_SIZE", 4096)
+RECURSION_LIMIT                = _env_int("PROMPT_PARSER_RECURSION_LIMIT", 0)
+
+if RECURSION_LIMIT > 0:
+    try:
+        sys.setrecursionlimit(RECURSION_LIMIT)
+    except (ValueError, RecursionError):
+        logger.warning("Failed to set recursion limit to %d", RECURSION_LIMIT)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,9 +95,14 @@ ATTENTION_AND_OPERATOR = "&"  # Внутреннее представление 
 _re_ws_collapse = re.compile(r"[ \t\r\n]+")
 
 @lru_cache(maxsize=CACHE_SIZE)
-def _collapse_spaces(s: str) -> str:
-    """Сжать повторяющиеся пробелы/переводы строк в один пробел и обрезать края."""
-    return _re_ws_collapse.sub(" ", s).strip()
+def _collapse_spaces(s: str, keep_edges: bool = False) -> str:
+    """Сжать повторяющиеся пробелы/переводы строк в один пробел.
+
+    Если ``keep_edges`` истинно, ведущие и хвостовые пробелы сохраняются,
+    иначе результат подрезается по краям.
+    """
+    collapsed = _re_ws_collapse.sub(" ", s)
+    return collapsed if keep_edges else collapsed.strip()
 
 def _unescape_literals(s: str) -> str:
     """
@@ -114,8 +151,7 @@ def _norm_join(*parts: str) -> str:
 
 def _norm_join_keep_edges(*parts: str) -> str:
     """Как _norm_join, но без .strip() по краям (используется локально при сборке)."""
-    s = _re_ws_collapse.sub(" ", "".join(parts))
-    return s
+    return _collapse_spaces("".join(parts), keep_edges=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Склейка префикса/ядра/суффикса с корректной обработкой пробелов
@@ -2395,23 +2431,20 @@ class DictWithShape(dict):
         return getattr(any_val, "shape", None)
 
 def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step):
-    # FIX #1: Защита от отсутствия Torch
-    if torch is None:
-        raise ImportError("Torch is required for reconstruct_cond_batch but not installed or imported.")
+    _torch = _ensure_torch()
         
     if not c or not c[0]:
         raise ValueError("Empty conditioning schedule")
-    # ... (остальной код функции без изменений) ...
     param = c[0][0].cond
     if param is None:
         raise ValueError("Invalid conditioning parameter")
     is_dict = isinstance(param, dict)
     if is_dict:
         dict_cond = param
-        res = {k: torch.zeros((len(c),) + v.shape, device=getattr(v, "device", "cpu"), dtype=getattr(v, "dtype", torch.float32)) for k, v in dict_cond.items()}
+        res = {k: _torch.zeros((len(c),) + v.shape, device=getattr(v, "device", "cpu"), dtype=getattr(v, "dtype", _torch.float32)) for k, v in dict_cond.items()}
         res = DictWithShape(res, (len(c),) + dict_cond.get('crossattn', next(iter(dict_cond.values()))).shape)
     else:
-        res = torch.zeros((len(c),) + param.shape, device=getattr(param, "device", "cpu"), dtype=getattr(param, "dtype", torch.float32))
+        res = _torch.zeros((len(c),) + param.shape, device=getattr(param, "device", "cpu"), dtype=getattr(param, "dtype", _torch.float32))
 
     for i, cond_schedule in enumerate(c):
         target_index = 0
@@ -2427,23 +2460,20 @@ def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_s
     return res
 
 def stack_conds(tensors):
-    # import torch удален, используем глобальную переменную
+    _torch = _ensure_torch()
     token_count = max([x.shape[0] for x in tensors])
     for i in range(len(tensors)):
         if tensors[i].shape[0] != token_count:
             last_vector = tensors[i][-1: ]
             last_vector_repeated = last_vector.repeat([token_count - tensors[i].shape[0], 1])
-            tensors[i] = torch.vstack([tensors[i], last_vector_repeated])
-    return torch.stack(tensors)
+            tensors[i] = _torch.vstack([tensors[i], last_vector_repeated])
+    return _torch.stack(tensors)
 
 def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
-    # FIX #1: Защита от отсутствия Torch
-    if torch is None:
-        raise ImportError("Torch is required for reconstruct_multicond_batch but not installed.")
+    _torch = _ensure_torch()
 
     if not c.batch or not c.batch[0]:
         raise ValueError("Empty multicond batch")
-    # ... (остальной код функции без изменений) ...
     param = c.batch[0][0].schedules[0].cond
     if param is None:
         raise ValueError("Invalid conditioning parameter")
@@ -2470,7 +2500,7 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
         stacked = {k: stack_conds([x[k] for x in tensors]) for k in keys}
         stacked = DictWithShape(stacked, stacked.get('crossattn', next(iter(stacked.values()))).shape)
     else:
-        stacked = stack_conds(tensors).to(device=getattr(param, "device", "cpu"), dtype=getattr(param, "dtype", torch.float32))
+        stacked = stack_conds(tensors).to(device=getattr(param, "device", "cpu"), dtype=getattr(param, "dtype", _torch.float32))
     return conds_list, stacked
 
 
