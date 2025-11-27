@@ -2401,7 +2401,6 @@ def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_s
         
     if not c or not c[0]:
         raise ValueError("Empty conditioning schedule")
-    # ... (остальной код функции без изменений) ...
     param = c[0][0].cond
     if param is None:
         raise ValueError("Invalid conditioning parameter")
@@ -2443,7 +2442,6 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
 
     if not c.batch or not c.batch[0]:
         raise ValueError("Empty multicond batch")
-    # ... (остальной код функции без изменений) ...
     param = c.batch[0][0].schedules[0].cond
     if param is None:
         raise ValueError("Invalid conditioning parameter")
@@ -2561,4 +2559,5 @@ def visualize_schedule(text: str, steps: int = 20, seed: int | None = None) -> s
         out_lines.append(f"Шаги {start}-{end}: {t}")
         prev_end = end
     return "\n".join(out_lines)
+
 
