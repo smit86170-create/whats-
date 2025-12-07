@@ -1315,8 +1315,7 @@ class CollectSteps(lark.Visitor):
             # "[...]: N" — «после границы»
             boundary = _clamp_step(int(round(weight * self.steps)) if weight <= 1.0 else int(round(weight)))
             prompt_texts = [_unescape_literals(resolve_tree(p, keep_spacing=True)) for p in prompts]
-            has_affixes = bool(self.prefix.strip() or self.suffix.strip())
-            if is_reverse and not has_affixes:
+            if is_reverse:
                 prompt_texts = prompt_texts[::-1]
             schedules = _build_bracket_after_schedules(self.prefix, prompt_texts, boundary, self.suffix, self.steps)
             return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
@@ -1862,7 +1861,7 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
                         rev_flag = bool(mrev)
                         if mrev:
                             post = (post or "")[mrev.end():]
-                        if rev_flag and not (pre.strip() or post.strip()):
+                        if rev_flag:
                             prompts = list(reversed(prompts))
                         boundary = _to_end_step(boundary_f, steps)
                         schedules = _build_bracket_inner_schedules(pre, prompts, boundary, post, steps)
@@ -1892,8 +1891,8 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
                     if m_rev:
                         post = (post or "")[m_rev.end():]
 
-                    # Реверс ТОЛЬКО для «чистой» формы (без префикса/суффикса)
-                    if rev_here and not ((pre or "").strip() or (post or "").strip()):
+                    # Реверс применяется, если он явно указан
+                    if rev_here:
                         inner_prompts = list(reversed(inner_prompts))
 
                     schedules = _build_bracket_after_schedules(pre, inner_prompts, boundary, post, steps)
