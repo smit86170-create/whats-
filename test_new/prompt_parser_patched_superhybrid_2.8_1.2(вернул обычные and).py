@@ -340,6 +340,33 @@ def _split_top_level_colon(s: str) -> list[str]:
 def _split_top_level_colon_keep_empty(s: str) -> list[str]:
     return _split_top_level_colon_all(s, keep_empty=True)
 
+
+def _has_multiple_bracket_blocks(s: str) -> bool:
+    """Проверить, есть ли более одного независимого блока ``[...]``.
+
+    Игнорирует экранированные скобки и вложенные уровни, чтобы не считать
+    ``[[nested]]`` как два блока. Возвращает ``True`` при втором входе в
+    глубину 1.
+    """
+    depth = 0
+    blocks = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "[":
+            depth += 1
+            if depth == 1:
+                blocks += 1
+                if blocks >= 2:
+                    return True
+        elif ch == "]" and depth > 0:
+            depth -= 1
+        i += 1
+    return False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Грамматика Lark
 # ──────────────────────────────────────────────────────────────────────────────
@@ -943,6 +970,8 @@ class CollectSteps(lark.Visitor):
     # — fast-path для "[...]:N [reverse]" на уровне prompt
     def visit_prompt(self, tree):
         full = resolve_tree(tree, keep_spacing=True)
+        if _has_multiple_bracket_blocks(full):
+            return self._default_visit(tree)
         # (A) Диапазоны после числа: "[a:b]:10 1-4,6-8 [reverse]"
         m_res = _extract_after_with_ranges(full, self.steps)
         if m_res and '|' not in full:
@@ -1006,6 +1035,8 @@ class CollectSteps(lark.Visitor):
 
     def visit_start(self, tree):
         full = resolve_tree(tree, keep_spacing=True).strip()
+        if _has_multiple_bracket_blocks(full):
+            return self._default_visit(tree)
         # ── FAST-PATH (1): "[a:b] : N RANGES [reverse]" — ОБРАБАТЫВАЕМ ПЕРВЫМ ──
         m_res = _extract_after_with_ranges(full, self.steps)
         if m_res and '|' not in full:
@@ -1138,6 +1169,10 @@ class CollectSteps(lark.Visitor):
 
         # 2) Объединённые границы всех детей
         boundaries = sorted({int(e) for sched in child_scheds for (e, _) in sched})
+        if boundaries and boundaries[-1] < self.steps:
+            boundaries.append(self.steps)
+        elif not boundaries:
+            boundaries = [self.steps]
 
         def pick_text(sched, step):
             for e, t in sched:
@@ -1702,7 +1737,9 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
     # Литеральные \n и \t → реальные
     if "\\n" in prompt or "\\t" in prompt:
         prompt = prompt.replace("\\n", "\n").replace("\\t", "\t")
-        
+
+    fast_path_allowed = not _has_multiple_bracket_blocks(prompt)
+
     # ── Быстрые пути ──────────────────────────────────────────────────────────
 
     # TL3: owner::: ... !!!
@@ -1762,79 +1799,82 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
 
 
     # Явные диапазоны: "[...]:N a-b,c-d [r]" — ДОЛЖНЫ идти ПЕРЕД общим "[...]:N"
-    m_res = _extract_after_with_ranges(prompt, steps)
-    if m_res:
-        prompts, ranges, rev_flag, _first_is_percent = m_res
-        if rev_flag:
-            prompts = list(reversed(prompts))
-        schedules = []
+    if fast_path_allowed:
+        m_res = _extract_after_with_ranges(prompt, steps)
+        if m_res:
+            prompts, ranges, rev_flag, _first_is_percent = m_res
+            if rev_flag:
+                prompts = list(reversed(prompts))
+            schedules = []
 
-        if ranges and ranges[0][0] > 1:
-            schedules.append([ranges[0][0] - 1, ""])
-        for i, (start, end) in enumerate(ranges[:len(prompts)]):
-            schedules.append([min(end, steps), prompts[i]])
-        if ranges and ranges[-1][1] < steps and prompts:
-            schedules.append([steps, prompts[-1]])
-        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+            if ranges and ranges[0][0] > 1:
+                schedules.append([ranges[0][0] - 1, ""])
+            for i, (start, end) in enumerate(ranges[:len(prompts)]):
+                schedules.append([min(end, steps), prompts[i]])
+            if ranges and ranges[-1][1] < steps and prompts:
+                schedules.append([steps, prompts[-1]])
+            return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
 
     # НОВЫЙ fast-path: "[...:N]" (число/доля *внутри* скобок)
     # Заменили точки на [^\[\]], чтобы не жадничать и не переполнять стек
-    m_inner = _re.match(r'(?s)^([^\[\]]*)\[([^\[\]]+)\]([^\[\]]*)$', prompt)
-    if m_inner and prompt.count('[') == 1 and prompt.count(']') == 1:
-        pre, inner, post = m_inner.groups()
-        # не конфликтуем со сложными конструкциями
-        # В этом fast-path нас интересует сложность ТОЛЬКО внутри inner.
-        if not _needs_complex_parse(inner or "", inner or ""):
-            parts = _split_top_level_colon_keep_empty(inner)
-            if len(parts) >= 2 and RE_NUMERIC_FULL.fullmatch(parts[-1]):
-                try:
-                    boundary_f = float(parts[-1])
-                except Exception:
-                    boundary_f = None
-                if boundary_f is not None:
-                    prompts = [_unescape_literals(p.strip()) for p in parts[:-1]]
-                    # reverse в постфиксе (как префиксный токен)
-                    mrev = RE_REVERSE_PREFIX.match(post or "")
-                    rev_flag = bool(mrev)
-                    if mrev:
-                        post = (post or "")[mrev.end():]
-                    if rev_flag and not (pre.strip() or post.strip()):
-                        prompts = list(reversed(prompts))
-                    boundary = _to_end_step(boundary_f, steps)
-                    schedules = _build_bracket_inner_schedules(pre, prompts, boundary, post, steps)
-                    return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+    if fast_path_allowed:
+        m_inner = _re.match(r'(?s)^([^\[\]]*)\[([^\[\]]+)\]([^\[\]]*)$', prompt)
+        if m_inner and prompt.count('[') == 1 and prompt.count(']') == 1:
+            pre, inner, post = m_inner.groups()
+            # не конфликтуем со сложными конструкциями
+            # В этом fast-path нас интересует сложность ТОЛЬКО внутри inner.
+            if not _needs_complex_parse(inner or "", inner or ""):
+                parts = _split_top_level_colon_keep_empty(inner)
+                if len(parts) >= 2 and RE_NUMERIC_FULL.fullmatch(parts[-1]):
+                    try:
+                        boundary_f = float(parts[-1])
+                    except Exception:
+                        boundary_f = None
+                    if boundary_f is not None:
+                        prompts = [_unescape_literals(p.strip()) for p in parts[:-1]]
+                        # reverse в постфиксе (как префиксный токен)
+                        mrev = RE_REVERSE_PREFIX.match(post or "")
+                        rev_flag = bool(mrev)
+                        if mrev:
+                            post = (post or "")[mrev.end():]
+                        if rev_flag and not (pre.strip() or post.strip()):
+                            prompts = list(reversed(prompts))
+                        boundary = _to_end_step(boundary_f, steps)
+                        schedules = _build_bracket_inner_schedules(pre, prompts, boundary, post, steps)
+                        return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
 
     # "[...]:N" с префиксом/суффиксом — общий случай
-    m_with_pre = RE_BRACKET_AFTER.match(prompt)
-    if m_with_pre and prompt.count('[') == 1 and prompt.count(']') == 1:
-        pre, inner, boundary_txt = m_with_pre.group(1), m_with_pre.group(2), m_with_pre.group(3)
-        rev_token = m_with_pre.group('rev')
-        post = m_with_pre.group('post') or ""
-        # Если в post есть явные диапазоны (например "6-8" или "10%-40%") — отдаем грамматике,
-        # иначе fast-path сломает семантику.
-        if _re.search(r'\b\d+%?\s*-\s*\d+%?', post):
-            pass  # не возвращаем — ниже сработает общий парсер
-        elif _needs_complex_parse(inner or "", prompt):
-            pass  # отдаём грамматике/Visitor
-        else:
-            try:
-                boundary = _to_end_step(float(boundary_txt), steps)
-                inner_prompts = [_unescape_literals(p.strip()) for p in _split_top_level_colon_keep_empty(inner)]
+    if fast_path_allowed:
+        m_with_pre = RE_BRACKET_AFTER.match(prompt)
+        if m_with_pre and prompt.count('[') == 1 and prompt.count(']') == 1:
+            pre, inner, boundary_txt = m_with_pre.group(1), m_with_pre.group(2), m_with_pre.group(3)
+            rev_token = m_with_pre.group('rev')
+            post = m_with_pre.group('post') or ""
+            # Если в post есть явные диапазоны (например "6-8" или "10%-40%") — отдаем грамматике,
+            # иначе fast-path сломает семантику.
+            if _re.search(r'\b\d+%?\s*-\s*\d+%?', post):
+                pass  # не возвращаем — ниже сработает общий парсер
+            elif _needs_complex_parse(inner or "", prompt):
+                pass  # отдаём грамматике/Visitor
+            else:
+                try:
+                    boundary = _to_end_step(float(boundary_txt), steps)
+                    inner_prompts = [_unescape_literals(p.strip()) for p in _split_top_level_colon_keep_empty(inner)]
 
-                # reverse мог прийти отдельным токеном ИЛИ как начало post (префикс)
-                m_rev = RE_REVERSE_PREFIX.match(post or "")
-                rev_here = bool(rev_token) or bool(m_rev)
-                if m_rev:
-                    post = (post or "")[m_rev.end():]
+                    # reverse мог прийти отдельным токеном ИЛИ как начало post (префикс)
+                    m_rev = RE_REVERSE_PREFIX.match(post or "")
+                    rev_here = bool(rev_token) or bool(m_rev)
+                    if m_rev:
+                        post = (post or "")[m_rev.end():]
 
-                # Реверс ТОЛЬКО для «чистой» формы (без префикса/суффикса)
-                if rev_here and not ((pre or "").strip() or (post or "").strip()):
-                    inner_prompts = list(reversed(inner_prompts))
+                    # Реверс ТОЛЬКО для «чистой» формы (без префикса/суффикса)
+                    if rev_here and not ((pre or "").strip() or (post or "").strip()):
+                        inner_prompts = list(reversed(inner_prompts))
 
-                schedules = _build_bracket_after_schedules(pre, inner_prompts, boundary, post, steps)
-                return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
-            except Exception:
-                pass
+                    schedules = _build_bracket_after_schedules(pre, inner_prompts, boundary, post, steps)
+                    return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
+                except Exception:
+                    pass
 
 
     # ── Обычный разбор ─────────────────────────────────────────────────────────
