@@ -245,29 +245,37 @@ def _extract_after_with_ranges(full: str, steps: int):
     ranges_txt = m.group("ranges")
     rev = m.group("rev")
 
-    def _to_steps_local(txt: str) -> int:
-        s = txt.strip()
-        if s.endswith('%'):
-            try:
-                return _clamp(round(float(s[:-1]) / 100.0 * steps), steps)
-            except Exception:
-                return 1
-        try:
-            return _clamp(round(float(s)), steps)
-        except Exception:
-            return 1
-
     prompts = [_unescape_literals(p.strip()) for p in _split_top_level_colon_keep_empty(inner)]
     ranges = []
     first_is_percent = None
+
     for part in (ranges_txt or "").split(','):
-        if '-' in part:
-            a, b = part.split('-', 1)
-            if first_is_percent is None:
-                first_is_percent = a.strip().endswith('%')
-            ra, rb = _to_steps_local(a), _to_steps_local(b)
-            if ra < rb:
-                ranges.append((ra, rb))
+        if '-' not in part:
+            continue
+        start_raw, end_raw = [x.strip() for x in part.split('-', 1)]
+        start_is_pct = start_raw.endswith('%')
+        end_is_pct = end_raw.endswith('%')
+
+        def _convert(txt: str, is_pct: bool) -> int | None:
+            try:
+                val = float(txt[:-1] if is_pct else txt)
+                if is_pct:
+                    val = val / 100.0 * steps
+                return _clamp(round(val), steps)
+            except Exception:
+                return None
+
+        start_val = _convert(start_raw, start_is_pct)
+        end_val = _convert(end_raw, end_is_pct)
+        if start_val is None or end_val is None:
+            continue
+        if start_val >= end_val:
+            continue
+        if first_is_percent is None:
+            first_is_percent = start_is_pct or end_is_pct
+        ranges.append((start_val, end_val))
+
+    ranges.sort(key=lambda r: r[0])
     rev_flag = bool(rev)
     return (prompts, ranges, rev_flag, bool(first_is_percent))
 
@@ -975,23 +983,36 @@ class CollectSteps(lark.Visitor):
         # (A) Диапазоны после числа: "[a:b]:10 1-4,6-8 [reverse]"
         m_res = _extract_after_with_ranges(full, self.steps)
         if m_res and '|' not in full:
-            prompts, ranges, rev_flag, first_is_percent = m_res
+            prompts, ranges, rev_flag, _ = m_res
+            if not ranges or not prompts:
+                return self._default_visit(tree)
+
+            prompt_texts = prompts[:len(ranges)]
             if rev_flag and not (self.prefix.strip() or self.suffix.strip()):
-                prompts = list(reversed(prompts))
-            schedules = []
+                prompt_texts = list(reversed(prompt_texts))
 
-            if ranges:
-                pre_end = max(1, ranges[0][0] - 1)
-                if first_is_percent:
-                    if ranges[0][0] > 1:
-                        schedules.append([pre_end, _concat_prefix_text_suffix(self.prefix, "", self.suffix)])
+            schedules: list[list[int, str]] = []
+
+            def _append(end: int, text: str) -> None:
+                if schedules and schedules[-1][1] == text:
+                    schedules[-1][0] = end
                 else:
-                    schedules.append([max(1, pre_end), _concat_prefix_text_suffix(self.prefix, "", self.suffix)])
+                    schedules.append([min(end, self.steps), text])
 
-            for i, (_st, en) in enumerate(ranges[:len(prompts)]):
-                schedules.append([min(en, self.steps), _concat_prefix_text_suffix(self.prefix, prompts[i], self.suffix)])
-            if ranges and ranges[-1][1] < self.steps and prompts:
-                schedules.append([self.steps, _concat_prefix_text_suffix(self.prefix, prompts[-1], self.suffix)])
+            current = 1
+            for text, (start, end) in zip(prompt_texts, ranges):
+                if start > self.steps:
+                    break
+                if start > current:
+                    _append(start - 1, _concat_prefix_text_suffix(self.prefix, "", self.suffix))
+                _append(min(end, self.steps), _concat_prefix_text_suffix(self.prefix, text, self.suffix))
+                current = min(end + 1, self.steps + 1)
+                if current > self.steps:
+                    break
+
+            if current <= self.steps:
+                _append(self.steps, _concat_prefix_text_suffix(self.prefix, "", self.suffix))
+
             return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
 
         # (B) «Чистый» "[...]:N [reverse]" без диапазонов — только если ровно одна пара []
@@ -1040,23 +1061,35 @@ class CollectSteps(lark.Visitor):
         # ── FAST-PATH (1): "[a:b] : N RANGES [reverse]" — ОБРАБАТЫВАЕМ ПЕРВЫМ ──
         m_res = _extract_after_with_ranges(full, self.steps)
         if m_res and '|' not in full:
-            prompts, ranges, rev_flag, first_is_percent = m_res
+            prompts, ranges, rev_flag, _ = m_res
+            if not ranges or not prompts:
+                return self._default_visit(tree)
+
+            prompt_texts = prompts[:len(ranges)]
             if rev_flag and not (self.prefix.strip() or self.suffix.strip()):
-                prompts = list(reversed(prompts))
-            schedules = []
+                prompt_texts = list(reversed(prompt_texts))
 
-            if ranges:
-                pre_end = max(1, ranges[0][0] - 1)
-                if first_is_percent:
-                    if ranges[0][0] > 1:
-                        schedules.append([pre_end, _concat_prefix_text_suffix(self.prefix, "", self.suffix)])
+            schedules: list[list[int, str]] = []
+
+            def _append(end: int, text: str) -> None:
+                if schedules and schedules[-1][1] == text:
+                    schedules[-1][0] = end
                 else:
-                    schedules.append([max(1, pre_end), _concat_prefix_text_suffix(self.prefix, "", self.suffix)])
+                    schedules.append([min(end, self.steps), text])
 
-            for i, (_st, en) in enumerate(ranges[:len(prompts)]):
-                schedules.append([min(en, self.steps), _concat_prefix_text_suffix(self.prefix, prompts[i], self.suffix)])
-            if ranges and ranges[-1][1] < self.steps and prompts:
-                schedules.append([self.steps, _concat_prefix_text_suffix(self.prefix, prompts[-1], self.suffix)])
+            current = 1
+            for text, (start, end) in zip(prompt_texts, ranges):
+                if start > self.steps:
+                    break
+                if start > current:
+                    _append(start - 1, _concat_prefix_text_suffix(self.prefix, "", self.suffix))
+                _append(min(end, self.steps), _concat_prefix_text_suffix(self.prefix, text, self.suffix))
+                current = min(end + 1, self.steps + 1)
+                if current > self.steps:
+                    break
+
+            if current <= self.steps:
+                _append(self.steps, _concat_prefix_text_suffix(self.prefix, "", self.suffix))
 
             return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
 
@@ -1242,47 +1275,42 @@ class CollectSteps(lark.Visitor):
         def _clamp_step(x: int) -> int:
             return max(1, min(x, self.steps))
 
-        step_intervals: list[tuple[int,int]] = []
-        first_is_percent: bool | None = None
+        step_intervals: list[tuple[int, int]] = []
 
         if step_range_list:
-            # Явные диапазоны
+            range_pattern = re.compile(
+                rf'^\s*(?P<start>{NUMERIC_RE})\s*(?P<start_pct>%?)\s*-\s*(?P<end>{NUMERIC_RE})\s*(?P<end_pct>%?)\s*$'
+            )
             for sr in step_range_list.children:
                 if not isinstance(sr, _l.Tree):
                     continue
-                data = getattr(sr, "data", None)
-                if data not in ("range_abs", "range_pct", "step_range"):
+
+                rng_txt = resolve_tree(sr, keep_spacing=False)
+                m = range_pattern.match(rng_txt)
+                if not m:
                     continue
 
-                nums = [resolve_tree(ch, keep_spacing=False)
-                        for ch in sr.children
-                        if isinstance(ch, _l.Token) and ch.type == "NUMBER"]
-                if len(nums) >= 2:
-                    start_txt, end_txt = nums[0], nums[-1]
-                else:
-                    rng_txt = resolve_tree(sr, keep_spacing=False)
-                    m = re.match(r'^\s*([-+]?(?:\d+(?:\.\d+)?|\.\d+))%?\s*-\s*([-+]?(?:\d+(?:\.\d+)?|\.\d+))%?\s*$', rng_txt)
-                    if not m:
-                        continue
-                    start_txt, end_txt = m.group(1), m.group(2)
-
-                is_percent = (data == "range_pct") or ('%' in resolve_tree(sr, keep_spacing=False))
-                if first_is_percent is None:
-                    first_is_percent = is_percent
-
-                def _to_steps(txt: str, is_pct: bool) -> int:
+                def _to_steps_local(val_txt: str, is_pct: bool) -> int | None:
                     try:
-                        val = float(txt)
+                        val = float(val_txt)
                         if is_pct:
                             val = val / 100.0 * self.steps
-                        return int(round(val))
+                        return _clamp_step(int(round(val)))
                     except Exception:
-                        return 1
+                        return None
 
-                start_step = _clamp_step(_to_steps(start_txt, is_percent))
-                end_step   = _clamp_step(_to_steps(end_txt,   is_percent))
-                if start_step <= end_step:
-                    step_intervals.append((start_step, end_step))
+                start_val = _to_steps_local(m.group("start"), bool(m.group("start_pct")))
+                end_val = _to_steps_local(m.group("end"), bool(m.group("end_pct")))
+                if start_val is None or end_val is None:
+                    continue
+                if start_val >= end_val:
+                    continue
+                step_intervals.append((start_val, end_val))
+
+            step_intervals.sort(key=lambda r: r[0])
+            if not step_intervals:
+                return [[self.steps, _concat_prefix_text_suffix(self.prefix, "", self.suffix)]]
+
         else:
             # "[...]: N" — «после границы»
             boundary = _clamp_step(int(round(weight * self.steps)) if weight <= 1.0 else int(round(weight)))
@@ -1293,34 +1321,31 @@ class CollectSteps(lark.Visitor):
             schedules = _build_bracket_after_schedules(self.prefix, prompt_texts, boundary, self.suffix, self.steps)
             return [[e, _apply_and(_collapse_spaces(t))] for e, t in schedules]
 
-        # ★ Фикс: пролог добавляем ТОЛЬКО если первый старт > 1 (и для процентов, и для чисел)
         schedules: list[list[int, str]] = []
-        if step_intervals:
-            first_start = step_intervals[0][0]
-            if first_start > 1:
-                pre_end = max(1, first_start - 1)
-                schedules.append([pre_end, _concat_prefix_text_suffix(self.prefix, "", self.suffix)])
 
+        prompt_texts = [_unescape_literals(resolve_tree(p, keep_spacing=True)) for p in prompts]
         if is_reverse:
-            prompts = prompts[::-1]
-            step_intervals = step_intervals[::-1]
+            prompt_texts = list(reversed(prompt_texts))
 
-        for i, (start, end) in enumerate(step_intervals[:len(prompts)]):
-            end = min(end, self.steps)
-            if start <= end:
-                p = prompts[i]
-                if isinstance(p, _l.Tree):
-                    child_schedules = self.visit(p)
-                    child_texts = [_unescape_literals(s[1]) for s in child_schedules] \
-              or [_unescape_literals(resolve_tree(p, keep_spacing=True))]
-                else:
-                    child_texts = [resolve_tree(p, keep_spacing=True)]
-                for txt in child_texts:
-                    schedules.append([end, _concat_prefix_text_suffix(self.prefix, txt, self.suffix)])
+        def _append(end: int, text: str) -> None:
+            if schedules and schedules[-1][1] == text:
+                schedules[-1][0] = end
+            else:
+                schedules.append([min(end, self.steps), text])
 
-        if step_intervals and step_intervals[-1][1] < self.steps:
-            tail_text = _unescape_literals(resolve_tree(prompts[-1], keep_spacing=True))
-            schedules.append([self.steps, _concat_prefix_text_suffix(self.prefix, tail_text, self.suffix)])
+        current = 1
+        for text, (start, end) in zip(prompt_texts, step_intervals):
+            if start > self.steps:
+                break
+            if start > current:
+                _append(start - 1, _concat_prefix_text_suffix(self.prefix, "", self.suffix))
+            _append(min(end, self.steps), _concat_prefix_text_suffix(self.prefix, text, self.suffix))
+            current = min(end + 1, self.steps + 1)
+            if current > self.steps:
+                break
+
+        if current <= self.steps:
+            _append(self.steps, _concat_prefix_text_suffix(self.prefix, "", self.suffix))
 
         if not schedules:
             return [[self.steps, _collapse_spaces(self.prefix + resolve_tree(tree, keep_spacing=True) + self.suffix)]]
