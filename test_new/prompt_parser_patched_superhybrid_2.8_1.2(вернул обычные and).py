@@ -387,7 +387,7 @@ if ALLOW_EMPTY_ALTERNATE:
 
 # NB: расширили класс одиночных знаков в start, чтобы '!' не валил парсер для plain'ов/compound'ов
 _grammar = r"""
-!start: (prompt | /[][():,!|&]/+)*
+!start: (prompt | /[():,!|&]/+)*
 
 prompt: (scheduled | emphasized | grouped
         | alternate | alternate_distinct
@@ -403,7 +403,9 @@ prompt: (scheduled | emphasized | grouped
 
 !weighted: plain ":" NUMBER
 
-scheduled: "[" [prompt (":" prompt)*] "]" ":" NUMBER (WHITESPACE* step_range_list)? (WHITESPACE* reverse_flag)?
+# Варианты планирования: число может быть до или после закрывающей скобки
+scheduled: "[" [prompt (":" prompt)* ":" NUMBER (WHITESPACE* step_range_list)?] "]" (WHITESPACE* reverse_flag)?
+        | "[" [prompt (":" prompt)*] "]" ":" NUMBER (WHITESPACE* step_range_list)? (WHITESPACE* reverse_flag)?
 reverse_flag: "reverse" | "r"
 step_range_list: step_range (WHITESPACE* "," WHITESPACE* step_range)*
 step_range: NUMBER "-" NUMBER        -> range_abs
@@ -1217,7 +1219,15 @@ class CollectSteps(lark.Visitor):
         out = []
         for end in boundaries:
             parts = [pick_text(s, end) for s in child_scheds]
-            text = self.prefix + "".join(parts) + self.suffix
+
+            if parts:
+                combined = parts[0]
+                for part in parts[1:]:
+                    combined = _concat_prefix_text_suffix(combined, "", part)
+            else:
+                combined = ""
+
+            text = _concat_prefix_text_suffix(self.prefix, combined, self.suffix)
             text = _apply_and(_collapse_spaces(text))
             if not out or out[-1][1] != text:
                 out.append([end, text])
@@ -1250,19 +1260,20 @@ class CollectSteps(lark.Visitor):
             return [[self.steps, _collapse_spaces(self.prefix + "empty_prompt" + self.suffix)]]
 
         import lark as _l
-        # Берём только поддеревья prompt (исключаем служебные узлы)
-        prompts = []
-        for node in tree.children:
-            if isinstance(node, _l.Tree):
-                data = getattr(node, "data", None)
-                if data == "prompt":
-                    prompts.append(node)
-                elif data in ("step_range_list", "reverse_flag"):
-                    continue
+        def _walk(nodes):
+            for n in nodes:
+                yield n
+                if isinstance(n, _l.Tree):
+                    yield from _walk(n.children)
 
-        number_node = next((p for p in tree.children if isinstance(p, _l.Token) and p.type == "NUMBER"), None)
-        step_range_list = next((p for p in tree.children if isinstance(p, _l.Tree) and getattr(p, "data", None) == "step_range_list"), None)
-        is_reverse = any(isinstance(p, _l.Tree) and getattr(p, "data", None) == "reverse_flag" for p in tree.children)
+        flat_nodes = list(_walk(tree.children))
+
+        # Берём только поддеревья prompt (исключаем служебные узлы)
+        prompts = [n for n in flat_nodes if isinstance(n, _l.Tree) and getattr(n, "data", None) == "prompt"]
+
+        number_node = next((p for p in flat_nodes if isinstance(p, _l.Token) and p.type == "NUMBER"), None)
+        step_range_list = next((p for p in flat_nodes if isinstance(p, _l.Tree) and getattr(p, "data", None) == "step_range_list"), None)
+        is_reverse = any(isinstance(p, _l.Tree) and getattr(p, "data", None) == "reverse_flag" for p in flat_nodes)
 
         try:
             weight = float(number_node.value) if number_node is not None else 1.0
@@ -1278,16 +1289,14 @@ class CollectSteps(lark.Visitor):
         step_intervals: list[tuple[int, int]] = []
 
         if step_range_list:
-            range_pattern = re.compile(
-                rf'^\s*(?P<start>{NUMERIC_RE})\s*(?P<start_pct>%?)\s*-\s*(?P<end>{NUMERIC_RE})\s*(?P<end_pct>%?)\s*$'
-            )
             for sr in step_range_list.children:
                 if not isinstance(sr, _l.Tree):
                     continue
+                if getattr(sr, "data", None) not in {"range_abs", "range_pct"}:
+                    continue
 
-                rng_txt = resolve_tree(sr, keep_spacing=False)
-                m = range_pattern.match(rng_txt)
-                if not m:
+                nums = [c for c in sr.children if isinstance(c, _l.Token) and c.type == "NUMBER"]
+                if len(nums) < 2:
                     continue
 
                 def _to_steps_local(val_txt: str, is_pct: bool) -> int | None:
@@ -1299,8 +1308,9 @@ class CollectSteps(lark.Visitor):
                     except Exception:
                         return None
 
-                start_val = _to_steps_local(m.group("start"), bool(m.group("start_pct")))
-                end_val = _to_steps_local(m.group("end"), bool(m.group("end_pct")))
+                is_pct = getattr(sr, "data", None) == "range_pct"
+                start_val = _to_steps_local(nums[0].value, is_pct)
+                end_val = _to_steps_local(nums[1].value, is_pct)
                 if start_val is None or end_val is None:
                     continue
                 if start_val >= end_val:
@@ -1333,7 +1343,12 @@ class CollectSteps(lark.Visitor):
                 schedules.append([min(end, self.steps), text])
 
         current = 1
-        for text, (start, end) in zip(prompt_texts, step_intervals):
+        if len(prompt_texts) == 1:
+            pairs = [(prompt_texts[0], rng) for rng in step_intervals]
+        else:
+            pairs = list(zip(prompt_texts, step_intervals))
+
+        for text, (start, end) in pairs:
             if start > self.steps:
                 break
             if start > current:
