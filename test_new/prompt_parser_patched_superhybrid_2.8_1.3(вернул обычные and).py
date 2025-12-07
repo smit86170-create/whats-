@@ -403,7 +403,6 @@ prompt: (scheduled | emphasized | grouped
 
 !weighted: plain ":" NUMBER
 
-# Варианты планирования: число может быть до или после закрывающей скобки
 scheduled: "[" [prompt (":" prompt)* ":" NUMBER (WHITESPACE* step_range_list)?] "]" (WHITESPACE* reverse_flag)?
         | "[" [prompt (":" prompt)*] "]" ":" NUMBER (WHITESPACE* step_range_list)? (WHITESPACE* reverse_flag)?
 reverse_flag: "reverse" | "r"
@@ -435,6 +434,7 @@ plain: /([^\\[\]\{\}\(\),&:!|]|\\.)+/
 %import common.SIGNED_NUMBER -> NUMBER
 %import common.INT -> NUMBER_Q
 """
+# Варианты планирования: число может быть до или после закрывающей скобки
 
 schedule_parser = lark.Lark(_grammar, start="start")
 
@@ -2670,3 +2670,4 @@ def visualize_schedule(text: str, steps: int = 20, seed: int | None = None) -> s
         out_lines.append(f"Шаги {start}-{end}: {t}")
         prev_end = end
     return "\n".join(out_lines)
+
