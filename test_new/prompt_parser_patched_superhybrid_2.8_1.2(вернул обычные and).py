@@ -87,6 +87,7 @@ RE_NUMERIC = re.compile(NUMERIC_RE)
 RE_NUMERIC_FULL = re.compile(rf"^(?:{NUMERIC_RE})$")
 # Добавить константу в начало файла (после imports)
 ATTENTION_AND_OPERATOR = "&"  # Внутреннее представление оператора AND
+ESCAPED_AMP_PLACEHOLDER = "__PROMPT_PARSER_ESCAPED_AMP__"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Вспомогалки по тексту/пробелам для единообразия вывода
@@ -113,6 +114,7 @@ def _unescape_literals(s: str) -> str:
     if not s:
         return s
     s = (s.replace(r"\:", ":")
+           .replace(r"\&", "&")
            .replace(r"\[", "[")
            .replace(r"\]", "]")
            .replace(r"\(", "(")
@@ -124,6 +126,14 @@ def _unescape_literals(s: str) -> str:
     # двойной бэкслеш в конце
     s = s.replace(r"\\", "\\")
     return s
+
+def _normalize_and_operators_for_parse(text: str) -> str:
+    """Нормализовать логический оператор до внутреннего символа, не трогая экранированный '&'."""
+    if not text:
+        return text
+    text = text.replace(r"\&", ESCAPED_AMP_PLACEHOLDER)
+    text = re.sub(r'(?<!\\)(?<=\w)&(?=\w)', ESCAPED_AMP_PLACEHOLDER, text)
+    return re.sub(rf'(?<![\\\w_])AND(?![\w_])', ATTENTION_AND_OPERATOR, text)
 
 def _strip_outer_parens_once(s: str) -> str:
     """Снять ОДИН раз внешние круглые скобки, если они действительно обрамляют весь текст."""
@@ -689,7 +699,7 @@ class ScheduleTransformer(lark.Transformer):
                 s = resolve_tree(child, keep_spacing=True)
                 if s:
                     parts.append(s)
-        return " and ".join(p for p in parts if p)
+        return f" {ATTENTION_AND_OPERATOR} ".join(p for p in parts if p)
 
     def weighted(self, args):
         """
@@ -1652,7 +1662,7 @@ class CollectSteps(lark.Visitor):
                 s = resolve_tree(child, keep_spacing=True)
                 if s:
                     parts.append(s)
-        text = " and ".join(parts)
+        text = f" {ATTENTION_AND_OPERATOR} ".join(parts)
         return [[self.steps, _collapse_spaces(self.prefix + text + self.suffix)]]
 
     def visit_emphasized(self, tree):
@@ -1720,19 +1730,22 @@ def _apply_and(text: str) -> str:
         text,
     )
 
-    # 2) Гарантируем одиночный пробел вокруг слова-операторов AND или символа &
-    # ИСПРАВЛЕНИЕ: Конвертируем только в единое внутреннее представление
-    text = re.sub(r'\s*(?<![\w_])AND(?![\w_])\s*', ' & ', text)
-    text = re.sub(r'\s*&\s*', ' & ', text)  # Нормализуем пробелы вокруг &
+    # 2) Приводим операторы к единому виду, игнорируя экранированный '&'
+    text = _normalize_and_operators_for_parse(text)
+    text = re.sub(
+        rf'(?<!\\)(\S)\s*{re.escape(ATTENTION_AND_OPERATOR)}\s*(\S)',
+        lambda m: f"{m.group(1)} {ATTENTION_AND_OPERATOR} {m.group(2)}",
+        text,
+    )  # Нормализуем пробелы вокруг &
 
     # 3) Схлопнуть множественные пробелы
     text = _re_ws_collapse.sub(" ", text)
 
     # 4) Разэкранируем литералы перед финальной отдачей
     text = _unescape_literals(text)
+    text = text.replace(ESCAPED_AMP_PLACEHOLDER, "&")
 
-    # 5) В самом конце заменяем & на "and" для вывода (если нужно)
-    # Это делается только при финальной отдаче пользователю
+    # 5) Готовый результат с согласованным представлением оператора AND
     return text
 
 
@@ -1797,6 +1810,8 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
     # Литеральные \n и \t → реальные
     if "\\n" in prompt or "\\t" in prompt:
         prompt = prompt.replace("\\n", "\n").replace("\\t", "\t")
+
+    prompt = _normalize_and_operators_for_parse(prompt)
 
     fast_path_allowed = not _has_multiple_bracket_blocks(prompt)
 
@@ -1963,7 +1978,7 @@ def _get_schedule_impl(prompt: str, steps: int, use_scheduling: bool, seed: int 
         tree = _parse_lark_cached(prompt)
     except lark.exceptions.LarkError as e:
         logger.warning("Prompt parse failed: '%s' — %s", prompt, e)
-        return [[steps, _collapse_spaces(prompt)]]
+        return [[steps, _apply_and(_collapse_spaces(prompt))]]
 
     collector = CollectSteps(steps, use_scheduling=use_scheduling, seed=seed)
     schedules = collector(tree)
@@ -2675,6 +2690,25 @@ if __name__ == "__main__":
     pa2 = parse_prompt_attention("dog\tcat")
     joined2 = "".join(t for t, w in pa2 if t != "BREAK").strip()
     assert joined2 == "dog cat", f"Expected 'dog cat', got {joined2!r}"
+
+    # --- AND operator normalization ---
+    g_and = lambda p: get_schedule(p, 4, True, seed=123)
+    assert g_and("cat and dog") == [[4, "cat and dog"]]
+    assert g_and("cat AND dog") == [[4, f"cat {ATTENTION_AND_OPERATOR} dog"]]
+    assert g_and("cat & dog") == [[4, f"cat {ATTENTION_AND_OPERATOR} dog"]]
+    assert g_and(r"R\&D") == [[4, "R&D"]]
+    assert g_and(r"\&") == [[4, "&"]]
+
+    _join_pa = lambda txt: "".join(t for t, w in parse_prompt_attention(txt) if t != "BREAK").strip()
+    assert _join_pa(r"R\&D") == "R&D"
+    assert _join_pa(r"\&") == "&"
+    assert _join_pa("cat AND dog") == f"cat {ATTENTION_AND_OPERATOR} dog"
+
+    import py_compile, pathlib, importlib.util
+    py_compile.compile(__file__, doraise=True)
+    spec = importlib.util.spec_from_file_location("prompt_parser_smoke", pathlib.Path(__file__))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
 
     print("All quick integration tests passed!")
 
